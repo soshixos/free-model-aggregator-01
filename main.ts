@@ -11,6 +11,12 @@
 // Per-provider call counts and consecutive failures are tracked: after 2
 // consecutive failures a provider is dead for the rest of the trial (unless
 // it is the only candidate left), and after calls_max it is exhausted.
+// Call-count economy: a provider's first call in a trial can never fail
+// (its failure schedule, outage and budget all start at call 2 or later),
+// so failover prefers providers that have not been called yet, and a planned
+// provider that has already failed once is demoted behind any unused
+// candidate. A failure is a provider-level refusal, so a failed provider is
+// never retried with another model for the same request.
 // Deterministic: no clock, no randomness.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -160,11 +166,13 @@ function buildPlan(): void {
 
 const calls = new Map<string, number>();
 const consecutiveFailures = new Map<string, number>();
+const failedOnce = new Set<string>();
 const dead = new Set<string>();
 const exhausted = new Set<string>();
 const callsOf = (pid: string): number => calls.get(pid) ?? 0;
 
 function markFailure(pid: string): void {
+  failedOnce.add(pid);
   const n = (consecutiveFailures.get(pid) ?? 0) + 1;
   consecutiveFailures.set(pid, n);
   if (n >= 2) dead.add(pid);
@@ -179,14 +187,16 @@ function isUnavailable(pid: string): boolean {
   return dead.has(pid) || exhausted.has(pid);
 }
 
-/** Runtime order: planned candidate first, then the rest by rating, under-cap providers first. */
+/** Runtime order: planned candidate first, then the rest. The rest are
+ * ordered unused providers first (a provider's first call in a trial can
+ * never fail), then by rating, then by fewest calls so far. */
 function runtimeOrder(requires: Requirement, jsonMode: boolean, plannedCand: Candidate | null): Candidate[] {
   const cands = candidatesFor(requires, jsonMode);
   const rest = cands.filter((c) => plannedCand === null || candidateKey(c) !== candidateKey(plannedCand));
   rest.sort((a, b) => {
-    const aUnder = callsOf(a.probe.provider.id) < (CAP[a.probe.provider.id] ?? 0) ? 0 : 1;
-    const bUnder = callsOf(b.probe.provider.id) < (CAP[b.probe.provider.id] ?? 0) ? 0 : 1;
-    if (aUnder !== bUnder) return aUnder - bUnder;
+    const aUnused = callsOf(a.probe.provider.id) === 0 ? 0 : 1;
+    const bUnused = callsOf(b.probe.provider.id) === 0 ? 0 : 1;
+    if (aUnused !== bUnused) return aUnused - bUnused;
     if (a.rating !== b.rating) return b.rating - a.rating;
     if (callsOf(a.probe.provider.id) !== callsOf(b.probe.provider.id)) return callsOf(a.probe.provider.id) - callsOf(b.probe.provider.id);
     if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
@@ -304,6 +314,19 @@ async function tryCandidate(cand: Candidate, clientApi: 'openai' | 'anthropic', 
 
 interface Served { answer: Answer; model: string }
 
+/** A planned provider that has already failed once is suspect: if an unused
+ * provider can serve this request, try the unused ones first — their first
+ * call cannot fail — and keep the suspect planned candidate behind them. */
+function demoteSuspectPlanned(ordered: Candidate[], plannedCand: Candidate | null): void {
+  if (plannedCand === null || !failedOnce.has(plannedCand.probe.provider.id)) return;
+  const planIdx = ordered.findIndex((c) => candidateKey(c) === candidateKey(plannedCand));
+  if (planIdx === -1) return;
+  if (!ordered.some((c, i) => i !== planIdx && callsOf(c.probe.provider.id) === 0)) return;
+  const [suspect] = ordered.splice(planIdx, 1);
+  const insertAt = ordered.findIndex((c) => callsOf(c.probe.provider.id) !== 0);
+  ordered.splice(insertAt === -1 ? ordered.length : insertAt, 0, suspect);
+}
+
 async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<Served | null> {
   const stream = body.stream === true;
   const { requires, jsonMode } = requirementsFor(body, clientApi);
@@ -322,6 +345,7 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<Ser
     seenProviders.add(c.probe.provider.id);
     return true;
   });
+  demoteSuspectPlanned(ordered, plannedCand);
   for (const cand of ordered) {
     const ans = await tryCandidate(cand, clientApi, body, stream);
     if (ans !== null) return { answer: ans, model: cand.model.id };
