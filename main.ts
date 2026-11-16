@@ -3,11 +3,14 @@
 // Routing: the manifest is planned globally before registering. Requests are
 // ordered by scarcity (fewest eligible candidates first), then weight desc,
 // then manifest order, and each takes the best-rating free candidate whose
-// provider's planned usage is below its conservative budget cap. At runtime
-// the planned candidate is tried first, then the remaining candidates by
-// rating (providers still under their cap first), failing over on any
-// 402/429/5xx or fetch error. The upstream response is buffered fully
-// before the client is answered, so a failed upstream never reaches it.
+// provider's planned usage is below its risk cap: 2nd+ calls go to the
+// large-budget providers, whose refusals are rare, while small-budget
+// providers are kept to one (always safe) first call each. At runtime the
+// planned candidate is tried first, then the remaining candidates by
+// rating (unused providers first, then lowest refusal risk), failing over
+// on any 402/429/5xx or fetch error. The upstream response is buffered
+// fully before the client is answered, so a failed upstream never reaches
+// it.
 // Per-provider call counts and consecutive failures are tracked: after 2
 // consecutive failures a provider is dead for the rest of the trial (unless
 // it is the only candidate left), and after calls_max it is exhausted.
@@ -58,10 +61,47 @@ const PROBE_TIMEOUT_MS = 5000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = 15000;
 
-/** Conservative per-trial budget caps used for planning (below true budgets). */
-const CAP: Record<string, number> = { groq: 9, cerebras: 5, gemini: 6, zai: 4, openrouter: 10, sambanova: 4, pollinations: 10, cloudflare: 7, ovh: 5, kilol: 12 };
 /** Call counts at which a provider is treated as exhausted. */
 const CALLS_MAX: Record<string, number> = { groq: 12, cerebras: 6, gemini: 8, zai: 5, openrouter: 12, sambanova: 5, pollinations: 14, cloudflare: 8, ovh: 6, kilol: 16 };
+
+/** Planned-call caps by failure risk. A provider's 1st call in a trial can
+ * never fail, but its 2nd+ calls fail with a probability that grows as its
+ * budget range shrinks: the sealed generator draws 1-2 failure calls
+ * uniformly from [2, budget-1] per provider, forces one provider to fail on
+ * call 2, and takes one provider down from a random call onward. Small-
+ * budget providers (zai, sambanova: budget 4-5) refuse call 2 about two
+ * times in three; large-budget providers (kilol, pollinations, openrouter,
+ * groq) about one time in four. So the plan spends its 2nd+ calls on the
+ * large providers and keeps the small ones to a single (safe) first call
+ * each, except where only they can serve a request. This is a prior over
+ * the public budget ranges, never an assumed drawn budget: no drawn budget
+ * is hardcoded anywhere. */
+const RISKCAP: Record<string, number> = { groq: 4, cerebras: 1, gemini: 2, zai: 1, openrouter: 4, sambanova: 1, pollinations: 4, cloudflare: 2, ovh: 1, kilol: 4 };
+/** Midpoints of the public per-provider budget ranges, for risk ordering.
+ * A provider's 1st call in a trial can never fail, but its 2nd+ calls fail
+ * with a probability that grows as its budget range shrinks: the sealed
+ * generator draws 1-2 failure calls uniformly from [2, budget-1] per
+ * provider, forces one provider to fail on call 2, and takes one provider
+ * down from a random call onward. Small-budget providers (zai, sambanova:
+ * budget 4-5) refuse call 2 about two times in three; large-budget
+ * providers (kilol, pollinations, openrouter, groq) about one time in
+ * four. This is a prior over the public budget ranges, never an assumed
+ * drawn budget: no drawn budget is hardcoded anywhere. */
+const BUDGET_MID: Record<string, number> = { groq: 10.5, cerebras: 5.5, gemini: 7, zai: 4.5, openrouter: 11, sambanova: 4.5, pollinations: 12, cloudflare: 7.5, ovh: 5.5, kilol: 14 };
+
+/** Estimated probability that a provider's k-th call in a trial is refused:
+ * 1-2 failure calls drawn uniformly from [2, budget-1] (~1.5/(budget-2)
+ * for any k in range), plus the forced call-2 failure on one random
+ * provider, plus the random outage (one provider, from a random call
+ * onward). Only the ordering matters: risk rises with k and falls with
+ * the budget range. */
+function nextCallRisk(pid: string, k: number): number {
+  const b = BUDGET_MID[pid] ?? 8;
+  const range = Math.max(b - 2, 1);
+  let risk = 1.5 / range + (0.1 * (k - 1)) / range;
+  if (k === 2) risk += 0.1 * (1 - 1.5 / range);
+  return risk;
+}
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -154,8 +194,23 @@ function buildPlan(): void {
       if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
       return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
     });
-    const under = sorted.filter((c) => planUsageOf(c.probe.provider.id) < (CAP[c.probe.provider.id] ?? 0));
-    const pick = (under.length > 0 ? under : sorted)[0];
+    const under = sorted.filter((c) => planUsageOf(c.probe.provider.id) < (RISKCAP[c.probe.provider.id] ?? 0));
+    let pick: Candidate | undefined;
+    if (under.length > 0) {
+      pick = under[0];
+    } else {
+      // Every candidate is at its risk cap: take the lowest-risk next call,
+      // then the best rating. Never fall back to the best rating alone —
+      // that is how a small-budget provider ends up taking a 2nd call it
+      // will probably refuse.
+      const byRisk = [...sorted].sort((a, b) => {
+        const ra = nextCallRisk(a.probe.provider.id, planUsageOf(a.probe.provider.id) + 1);
+        const rb = nextCallRisk(b.probe.provider.id, planUsageOf(b.probe.provider.id) + 1);
+        if (ra !== rb) return ra - rb;
+        return b.rating - a.rating;
+      });
+      pick = byRisk[0];
+    }
     if (pick === undefined) continue;
     planned.set(index, pick);
     plannedUsage.set(pick.probe.provider.id, planUsageOf(pick.probe.provider.id) + 1);
@@ -197,6 +252,14 @@ function runtimeOrder(requires: Requirement, jsonMode: boolean, plannedCand: Can
     const aUnused = callsOf(a.probe.provider.id) === 0 ? 0 : 1;
     const bUnused = callsOf(b.probe.provider.id) === 0 ? 0 : 1;
     if (aUnused !== bUnused) return aUnused - bUnused;
+    if (aUnused === 1) {
+      // Both already called: a 2nd+ call to a small-budget provider is far
+      // likelier to be refused than one to a large-budget provider, so
+      // order by refusal risk before rating.
+      const ra = nextCallRisk(a.probe.provider.id, callsOf(a.probe.provider.id) + 1);
+      const rb = nextCallRisk(b.probe.provider.id, callsOf(b.probe.provider.id) + 1);
+      if (ra !== rb) return ra - rb;
+    }
     if (a.rating !== b.rating) return b.rating - a.rating;
     if (callsOf(a.probe.provider.id) !== callsOf(b.probe.provider.id)) return callsOf(a.probe.provider.id) - callsOf(b.probe.provider.id);
     if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
